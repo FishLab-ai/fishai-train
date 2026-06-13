@@ -1,5 +1,5 @@
 """
-TinyAI - 4-bit 整数量化导出
+FishAI - 4-bit 整数量化导出
 
 量化方案: INT4 Per-Channel 对称量化
 - 量化公式: value = (int4 - zero_point) * scale

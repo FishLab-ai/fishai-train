@@ -1,5 +1,5 @@
 """
-TinyAI - 完全自研的 GPT 模型定义
+FishAI - 完全自研的 GPT 模型定义
 
 从零实现每一个组件：
 1. Token Embedding + 位置编码

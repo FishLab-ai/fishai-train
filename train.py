@@ -1,5 +1,5 @@
 """
-TinyAI - 训练脚本
+FishAI - 训练脚本
 
 完整的训练流程:
 1. 数据预处理 (中文 + 英文 + 代码)
@@ -184,7 +184,7 @@ def train(args):
     )
 
     print(f"\n{'='*60}")
-    print(f"  TinyAI 训练配置")
+    print(f"  FishAI 训练配置")
     print(f"{'='*60}")
     print(f"  参数量: {config.total_params() / 1e6:.1f}M")
     print(f"  4-bit 量化: {config.quantized_size_mb():.1f} MB")
@@ -233,9 +233,9 @@ def train(args):
     # Wandb
     if HAS_WANDB and args.use_wandb:
         wandb.init(
-            project="tinyai",
+            project="fishai",
             config=vars(args),
-            name=f"tinyai-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+            name=f"fishai-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
         )
 
     # 输出目录
@@ -349,7 +349,7 @@ def train(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TinyAI 训练脚本")
+    parser = argparse.ArgumentParser(description="FishAI 训练脚本")
 
     # 数据
     parser.add_argument("--data", type=str, default="./data", help="训练数据路径")
