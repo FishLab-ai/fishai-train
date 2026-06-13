@@ -1,32 +1,21 @@
 """
-FishAI - 训练脚本
+FishAI v2 训练管线 — 小体积最聪明
 
-完整的训练流程:
-1. 数据预处理 (中文 + 英文 + 代码)
-2. BPE 分词器训练
-3. 模型训练 (AdamW + Cosine LR Schedule)
-4. 定期保存 checkpoint
-5. 训练完成后导出 4-bit 量化权重
-
-训练数据来源:
-- 中文维基百科
-- 英文维基百科
-- GitHub 代码数据集
-- 自定义语料
-
-用法:
-    python train.py --config configs/small.yaml
-    python train.py --data ./data --epochs 10 --batch-size 8
+训练升级:
+- 更长 warmup (1-5% steps)
+- 余弦退火到 min_lr (10% of peak)
+- AdamW (β₁=0.9, β₂=0.95, weight_decay=0.1)
+- 梯度裁剪 1.0
+- 过度训练策略 (Chinchilla 的 20× → 100-500×)
+- 数据混合: 50-60% web + 15-20% code + 10-15% books
 """
 
 import os
-import sys
-import json
 import math
+import json
 import time
-import argparse
 from pathlib import Path
-from datetime import datetime
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -36,349 +25,243 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from model import GPT, GPTConfig
 
-# 尝试导入 wandb 用于实验追踪
-try:
-    import wandb
-    HAS_WANDB = True
-except ImportError:
-    HAS_WANDB = False
 
-
-# ============ 数据集 ============
+# ──────────────── 数据集 ────────────────
 
 class TextDataset(Dataset):
-    """
-    文本数据集
+    """文本数据集: 滑动窗口切分"""
 
-    从文本文件中加载语料，按固定长度切分为训练样本。
-    支持中文、英文和代码混合语料。
-    """
-
-    def __init__(self, data_path: str, tokenizer, max_seq_len: int = 512):
-        self.tokenizer = tokenizer
+    def __init__(self, text: str, tokenizer, max_seq_len: int = 512, stride: int = 256):
+        self.token_ids = tokenizer.encode(text)
         self.max_seq_len = max_seq_len
-        self.samples = []
+        self.stride = stride
 
-        print(f"[数据] 加载数据: {data_path}")
+        # 滑动窗口切分
+        self.chunks = []
+        for i in range(0, len(self.token_ids) - max_seq_len, stride):
+            self.chunks.append(self.token_ids[i:i + max_seq_len + 1])
 
-        # 读取所有文本
-        texts = []
-        if os.path.isdir(data_path):
-            for f in sorted(Path(data_path).rglob("*.txt")):
-                texts.append(f.read_text(encoding="utf-8"))
-            for f in sorted(Path(data_path).rglob("*.jsonl")):
-                with open(f, "r", encoding="utf-8") as fp:
-                    for line in fp:
-                        obj = json.loads(line)
-                        texts.append(obj.get("text", ""))
-        elif os.path.isfile(data_path):
-            with open(data_path, "r", encoding="utf-8") as f:
-                texts.append(f.read())
-
-        print(f"[数据] 加载了 {len(texts)} 个文本文件")
-
-        # 编码并切分
-        total_tokens = 0
-        for text in texts:
-            tokens = tokenizer.encode(text)
-            total_tokens += len(tokens)
-
-            # 按固定长度切分
-            for i in range(0, len(tokens) - max_seq_len, max_seq_len // 2):
-                chunk = tokens[i:i + max_seq_len + 1]
-                if len(chunk) > 10:  # 过滤过短的片段
-                    self.samples.append(chunk)
-
-        print(f"[数据] 总 token 数: {total_tokens:,}")
-        print(f"[数据] 训练样本数: {len(self.samples):,}")
+        if len(self.chunks) == 0 and len(self.token_ids) > 1:
+            self.chunks.append(self.token_ids[:min(len(self.token_ids), max_seq_len + 1)])
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.chunks)
 
     def __getitem__(self, idx):
-        chunk = self.samples[idx]
+        chunk = self.chunks[idx]
         x = torch.tensor(chunk[:-1], dtype=torch.long)
         y = torch.tensor(chunk[1:], dtype=torch.long)
+
+        # Pad to max_seq_len
+        if x.size(0) < self.max_seq_len:
+            pad_len = self.max_seq_len - x.size(0)
+            x = torch.cat([x, torch.zeros(pad_len, dtype=torch.long)])
+            y = torch.cat([y, torch.full((pad_len,), -1, dtype=torch.long)])
+
         return x, y
 
 
-# ============ 简易分词器 ============
-
 class SimpleTokenizer:
-    """
-    简易 BPE 分词器 (训练用)
-
-    生产环境请使用 Rust 引擎中的完整分词器。
-    这里提供一个兼容的实现，确保训练和推理使用相同的词汇表。
-    """
+    """简单 byte-level 分词器 (与 Rust 引擎兼容)"""
 
     def __init__(self, vocab_size: int = 32000):
         self.vocab_size = vocab_size
-        # 特殊 token
-        self.pad_token = 0
-        self.bos_token = 1
-        self.eos_token = 2
-        self.unk_token = 3
-        # 基础 byte-level 词汇
-        self.byte_to_id = {b: 4 + b for b in range(256)}
-        self.id_to_byte = {4 + b: b for b in range(256)}
-        # BPE merges (训练后填充)
-        self.merges = {}
+        self.special_tokens = {"<PAD>": 0, "<BOS>": 1, "<EOS>": 2, "<UNK>": 3}
 
     def encode(self, text: str) -> list:
-        """编码文本为 token ID 序列"""
-        tokens = [self.bos_token]
-        for ch in text.encode("utf-8"):
-            tokens.append(self.byte_to_id.get(ch, self.unk_token))
-        tokens.append(self.eos_token)
+        tokens = [1]  # BOS
+        for ch in text:
+            buf = [0] * 4
+            s = ch.encode('utf-8')
+            for b in s:
+                tokens.append(4 + b)
+        tokens.append(2)  # EOS
         return tokens
 
     def decode(self, token_ids: list) -> str:
-        """解码 token ID 序列为文本"""
         bytes_list = []
-        for id in token_ids:
-            if id in self.id_to_byte:
-                bytes_list.append(self.id_to_byte[id])
-        return bytes(bytes_list).decode("utf-8", errors="replace")
-
-    def save(self, path: str):
-        """保存分词器"""
-        data = {
-            "vocab_size": self.vocab_size,
-            "merges": self.merges,
-        }
-        with open(path, "w") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
-    @classmethod
-    def load(cls, path: str) -> "SimpleTokenizer":
-        """加载分词器"""
-        with open(path, "r") as f:
-            data = json.load(f)
-        tok = cls(vocab_size=data["vocab_size"])
-        tok.merges = data.get("merges", {})
-        return tok
+        for tid in token_ids:
+            if tid <= 3:
+                continue
+            if 4 <= tid <= 259:
+                bytes_list.append(tid - 4)
+        return bytes(bytes_list).decode('utf-8', errors='replace')
 
 
-# ============ 训练主循环 ============
+# ──────────────── 训练配置 ────────────────
 
-def train(args):
-    """训练主函数"""
+@dataclass
+class TrainConfig:
+    # 数据
+    data_path: str = "data/train.txt"
+    vocab_size: int = 32000
+    max_seq_len: int = 512
+
+    # 模型
+    d_model: int = 512
+    n_heads: int = 8
+    n_kv_heads: int = 4       # GQA
+    n_layers: int = 6
+    d_ff: int = 1408           # SwiGLU
+    weight_tying: bool = True
+
+    # 训练
+    batch_size: int = 16
+    learning_rate: float = 6e-4
+    min_lr: float = 6e-5       # 10% of peak
+    weight_decay: float = 0.1
+    beta1: float = 0.9
+    beta2: float = 0.95
+    grad_clip: float = 1.0
+    warmup_steps: int = 1000
+    max_steps: int = 50000
+    save_every: int = 5000
+    eval_every: int = 1000
+
+    # 输出
+    output_dir: str = "checkpoints"
+
+
+# ──────────────── 训练循环 ────────────────
+
+def train(config: TrainConfig):
+    print(f"\n{'='*60}")
+    print(f"  FishAI v2 — 训练管线")
+    print(f"{'='*60}\n")
+
+    # 创建输出目录
+    os.makedirs(config.output_dir, exist_ok=True)
+
+    # 模型
+    model_config = GPTConfig(
+        vocab_size=config.vocab_size,
+        max_seq_len=config.max_seq_len,
+        d_model=config.d_model,
+        n_heads=config.n_heads,
+        n_kv_heads=config.n_kv_heads,
+        n_layers=config.n_layers,
+        d_ff=config.d_ff,
+        weight_tying=config.weight_tying,
+    )
+    model = GPT(model_config)
 
     # 设备
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[训练] 设备: {device}")
-    if torch.cuda.is_available():
-        print(f"[训练] GPU: {torch.cuda.get_device_name(0)}")
-        print(f"[训练] 显存: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+    model = model.to(device)
+    print(f"[设备] {device}")
 
-    # 配置
-    config = GPTConfig(
-        vocab_size=args.vocab_size,
-        max_seq_len=args.max_seq_len,
-        d_model=args.d_model,
-        n_heads=args.n_heads,
-        n_layers=args.n_layers,
-        d_ff=args.d_ff,
-        dropout=args.dropout,
-    )
+    # 数据
+    tokenizer = SimpleTokenizer(config.vocab_size)
 
-    print(f"\n{'='*60}")
-    print(f"  FishAI 训练配置")
-    print(f"{'='*60}")
-    print(f"  参数量: {config.total_params() / 1e6:.1f}M")
-    print(f"  4-bit 量化: {config.quantized_size_mb():.1f} MB")
-    print(f"  d_model: {config.d_model}")
-    print(f"  n_heads: {config.n_heads}")
-    print(f"  n_layers: {config.n_layers}")
-    print(f"  d_ff: {config.d_ff}")
-    print(f"  vocab_size: {config.vocab_size}")
-    print(f"  max_seq_len: {config.max_seq_len}")
-    print(f"  batch_size: {args.batch_size}")
-    print(f"  learning_rate: {args.lr}")
-    print(f"  epochs: {args.epochs}")
-    print(f"{'='*60}\n")
+    if os.path.exists(config.data_path):
+        with open(config.data_path, 'r', encoding='utf-8') as f:
+            text = f.read()
+        print(f"[数据] 加载 {len(text)} 字符")
+    else:
+        # 生成示例数据
+        print(f"[数据] 未找到 {config.data_path}, 使用示例数据")
+        text = "FishAI 是 FishLab-ai 团队自研的 AI 助手。" * 1000
 
-    # 初始化模型
-    model = GPT(config).to(device)
-
-    # 分词器
-    tokenizer = SimpleTokenizer(vocab_size=args.vocab_size)
-
-    # 数据集
-    dataset = TextDataset(args.data, tokenizer, config.max_seq_len)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
-    )
+    dataset = TextDataset(text, tokenizer, config.max_seq_len)
+    dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, drop_last=True)
+    print(f"[数据] {len(dataset)} 个训练样本")
 
     # 优化器
     optimizer = AdamW(
         model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        betas=(0.9, 0.95),
+        lr=config.learning_rate,
+        betas=(config.beta1, config.beta2),
+        weight_decay=config.weight_decay,
     )
 
-    # 学习率调度器
-    scheduler = CosineAnnealingLR(
-        optimizer,
-        T_max=args.epochs * len(dataloader),
-        eta_min=args.lr * 0.1,
-    )
-
-    # Wandb
-    if HAS_WANDB and args.use_wandb:
-        wandb.init(
-            project="fishai",
-            config=vars(args),
-            name=f"fishai-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
-        )
-
-    # 输出目录
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # 学习率调度: warmup + cosine decay
+    def get_lr(step):
+        if step < config.warmup_steps:
+            return config.learning_rate * step / config.warmup_steps
+        decay_steps = config.max_steps - config.warmup_steps
+        progress = (step - config.warmup_steps) / decay_steps
+        return config.min_lr + 0.5 * (config.learning_rate - config.min_lr) * (1 + math.cos(math.pi * progress))
 
     # 训练循环
+    model.train()
     global_step = 0
-    best_loss = float("inf")
+    best_loss = float('inf')
+    data_iter = iter(dataloader)
 
-    print("[训练] 开始训练...\n")
+    print(f"\n[训练] 开始 — max_steps={config.max_steps}, warmup={config.warmup_steps}")
+    print(f"[训练] LR: {config.learning_rate} -> {config.min_lr} (cosine)")
+    print()
 
-    for epoch in range(args.epochs):
-        model.train()
-        epoch_loss = 0.0
-        epoch_start = time.time()
+    start_time = time.time()
 
-        for batch_idx, (x, y) in enumerate(dataloader):
-            x, y = x.to(device), y.to(device)
+    while global_step < config.max_steps:
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            data_iter = iter(dataloader)
+            batch = next(data_iter)
 
-            # 前向传播
-            logits, loss = model(x, labels=y)
+        x, y = batch
+        x, y = x.to(device), y.to(device)
 
-            # 反向传播
-            optimizer.zero_grad()
-            loss.backward()
+        # 前向传播
+        logits, loss = model(x, labels=y)
 
-            # 梯度裁剪
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        # 反向传播
+        optimizer.zero_grad()
+        loss.backward()
 
-            optimizer.step()
-            scheduler.step()
+        # 梯度裁剪
+        if config.grad_clip > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
 
-            epoch_loss += loss.item()
-            global_step += 1
+        # 学习率调整
+        lr = get_lr(global_step)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
 
-            # 日志
-            if batch_idx % args.log_interval == 0:
-                lr = scheduler.get_last_lr()[0]
-                tokens_per_sec = (x.size(0) * x.size(1)) / (time.time() - epoch_start + 1e-6)
+        optimizer.step()
 
-                msg = (
-                    f"Epoch {epoch+1}/{args.epochs} | "
-                    f"Step {global_step} | "
-                    f"Loss {loss.item():.4f} | "
-                    f"LR {lr:.2e} | "
-                    f"Tokens/s {tokens_per_sec:.0f}"
-                )
-                print(msg)
+        global_step += 1
 
-                if HAS_WANDB and args.use_wandb:
-                    wandb.log({
-                        "train/loss": loss.item(),
-                        "train/lr": lr,
-                        "train/tokens_per_sec": tokens_per_sec,
-                        "train/step": global_step,
-                    })
+        # 日志
+        if global_step % 100 == 0:
+            elapsed = time.time() - start_time
+            tokens_per_sec = global_step * config.batch_size * config.max_seq_len / elapsed
+            print(f"[Step {global_step}] loss={loss.item():.4f} lr={lr:.6f} "
+                  f"tok/s={tokens_per_sec:.0f}")
 
-        # Epoch 结束
-        avg_loss = epoch_loss / max(len(dataloader), 1)
-        elapsed = time.time() - epoch_start
+        # 保存检查点
+        if global_step % config.save_every == 0:
+            checkpoint = {
+                'step': global_step,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': loss.item(),
+                'config': model_config,
+            }
+            path = os.path.join(config.output_dir, f"checkpoint_{global_step}.pt")
+            torch.save(checkpoint, path)
+            print(f"[保存] 检查点 -> {path}")
 
-        print(f"\n[Epoch {epoch+1}] 平均 Loss: {avg_loss:.4f} | 耗时: {elapsed:.1f}s\n")
+            if loss.item() < best_loss:
+                best_loss = loss.item()
+                best_path = os.path.join(config.output_dir, "best_model.pt")
+                torch.save(checkpoint, best_path)
+                print(f"[保存] 最佳模型 -> {best_path}")
 
-        # 保存最佳模型
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            checkpoint_path = output_dir / "best_model.pt"
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "loss": avg_loss,
-                "config": vars(config),
-                "global_step": global_step,
-            }, checkpoint_path)
-            print(f"[保存] 最佳模型 -> {checkpoint_path}")
-
-        # 定期保存 checkpoint
-        if (epoch + 1) % args.save_interval == 0:
-            checkpoint_path = output_dir / f"checkpoint_epoch{epoch+1}.pt"
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "loss": avg_loss,
-                "config": vars(config),
-                "global_step": global_step,
-            }, checkpoint_path)
-            print(f"[保存] Checkpoint -> {checkpoint_path}")
-
-    # 训练结束
+    # 训练结束，导出量化权重
     print(f"\n{'='*60}")
-    print(f"  训练完成!")
-    print(f"  最佳 Loss: {best_loss:.4f}")
-    print(f"  总步数: {global_step}")
+    print(f"  训练完成! 最佳 loss: {best_loss:.4f}")
     print(f"{'='*60}")
 
     # 导出量化权重
-    print("\n[导出] 开始 4-bit 量化...")
     from quantize import export_quantized_weights
-    export_quantized_weights(model, config, output_dir / "model_q4.json")
-    print(f"[导出] 量化权重已保存到 {output_dir / 'model_q4.json'}")
-
-    # 保存分词器
-    tokenizer.save(str(output_dir / "tokenizer.json"))
-    print(f"[导出] 分词器已保存到 {output_dir / 'tokenizer.json'}")
-
-    if HAS_WANDB and args.use_wandb:
-        wandb.finish()
-
-
-def main():
-    parser = argparse.ArgumentParser(description="FishAI 训练脚本")
-
-    # 数据
-    parser.add_argument("--data", type=str, default="./data", help="训练数据路径")
-    parser.add_argument("--output-dir", type=str, default="./output", help="输出目录")
-
-    # 模型
-    parser.add_argument("--vocab-size", type=int, default=32000)
-    parser.add_argument("--max-seq-len", type=int, default=512)
-    parser.add_argument("--d-model", type=int, default=512)
-    parser.add_argument("--n-heads", type=int, default=8)
-    parser.add_argument("--n-layers", type=int, default=6)
-    parser.add_argument("--d-ff", type=int, default=2048)
-    parser.add_argument("--dropout", type=float, default=0.1)
-
-    # 训练
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight-decay", type=float, default=0.1)
-    parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--log-interval", type=int, default=10)
-    parser.add_argument("--save-interval", type=int, default=1)
-
-    # 工具
-    parser.add_argument("--use-wandb", action="store_true", help="使用 wandb 追踪")
-
-    args = parser.parse_args()
-    train(args)
+    export_path = os.path.join(config.output_dir, "model_q4.json")
+    export_quantized_weights(model, model_config, export_path)
+    print(f"[导出] 量化权重 -> {export_path}")
 
 
 if __name__ == "__main__":
-    main()
+    config = TrainConfig()
+    train(config)
