@@ -1,0 +1,7 @@
+# TinyAI 训练管线依赖
+torch>=2.0
+numpy
+tokenizers>=0.13
+datasets
+wandb
+tqdm
