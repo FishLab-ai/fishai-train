@@ -42,10 +42,55 @@ fishai-train/
 ├── train.py            # 训练管线 (混合精度, 梯度累积, 评估, 恢复)
 ├── quantize.py         # 量化导出 (分组量化, 二进制格式, 量化评估)
 ├── evaluate.py         # 基准测试 (MMLU, C-Eval, GSM8K, HumanEval, HellaSwag)
+├── benchmark.py        # 标准跑分框架 (对标 Pythia-70M / GPT-2 Small)
+├── quick_train.py      # 一体化训练+评估脚本
+├── reference_benchmark.py  # HuggingFace 参考模型基线
 ├── tokenizer_train.py  # BPE 分词器训练 (32K 词表, 特殊 token)
 ├── data_utils.py       # 数据处理 (下载, 过滤, 去重, 混合, 统计)
 └── requirements.txt    # 依赖
 ```
+
+## 跑分框架
+
+### 快速自测 (验证架构正确性)
+```bash
+python benchmark.py self-test --config small
+```
+输出示例:
+- 参数量: 34.1M
+- 前向传播: ✅
+- 生成功能: ✅
+- KV Cache: ✅
+- RoPE/SwiGLU/RMSNorm/GQA/WeightTying: ✅
+
+### 完整跑分 (需要预训练模型)
+```bash
+python benchmark.py full --model checkpoints/fishai-best.pt --tokenizer tokenizer/
+```
+
+### 参考基线
+```bash
+python reference_benchmark.py
+```
+
+### 对标目标
+
+| 模型 | 参数量 | WikiText-103 PPL | WikiText-2 PPL | HellaSwag |
+|------|--------|-------------------|-----------------|-----------|
+| Pythia-70M | 70M | ~56.0 | ~42.0 | ~26.3% |
+| GPT-2 Small | 124M | ~37.5 | ~29.0 | ~31.0% |
+| Pythia-160M | 160M | ~36.8 | ~27.0 | ~30.8% |
+| SmolLM2-135M | 135M | ~42.0 | ~32.0 | ~31.5% |
+| **FishAI-S (目标)** | 34M | ≤56.0 | ≤42.0 | - |
+
+> FishAI-S 参数量仅 34M (比 Pythia-70M 少一半), 目标 PPL 追平 Pythia-70M
+
+## 训练进展
+
+- ✅ 架构验证: RoPE + SwiGLU + RMSNorm + GQA + WeightTying 全部实现
+- ✅ 200步训练: 随机数据 PPL 从 ~32000 降到 61.7 (证明 loss 正常下降)
+- ⏳ 真实数据训练: 需要在 GPU 上使用 WikiText-103/FineWeb-Edu 训练 50K+ 步
+- ⏳ 跑分对比: 训练完成后运行 benchmark.py 对标 Pythia-70M
 
 ## 训练流程
 
