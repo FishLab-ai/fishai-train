@@ -1,7 +1,28 @@
-# TinyAI 训练管线依赖
+# FishAI v3 训练管线依赖
+# 核心框架
 torch>=2.0
 numpy
+
+# 分词器
 tokenizers>=0.13
-datasets
+
+# 数据集
+datasets>=2.14
+
+# 实验追踪
 wandb
+
+# 进度条
 tqdm
+
+# 评估基准
+lm-eval>=0.4
+
+# Tokenizer 兼容性
+transformers
+
+# 分布式训练
+accelerate
+
+# 科学计算 (评估指标)
+scipy
