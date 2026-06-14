@@ -1,0 +1,79 @@
+name: FishAI Train Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'model.py'
+      - 'train.py'
+      - 'tokenizer_train.py'
+  workflow_dispatch:
+    inputs:
+      model_size:
+        description: 'Model size (small/medium)'
+        required: false
+        default: 'small'
+      max_steps:
+        description: 'Max training steps'
+        required: false
+        default: '1000'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+      - name: Model Architecture Test
+        run: |
+          python -c "from model import GPT, GPTConfig, get_model_config; c = get_model_config('small'); m = GPT(c); print(f'Model OK: {sum(p.numel() for p in m.parameters())/1e6:.1f}M params')"
+      - name: Quick Self-Test
+        run: |
+          python benchmark.py self-test --config small --device cpu
+
+  train-small:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Quick Train
+        run: |
+          python quick_train.py --max-steps ${{ github.event.inputs.max_steps || '1000' }} --model-size ${{ github.event.inputs.model_size || 'small' }}
+      - name: Upload checkpoint
+        uses: actions/upload-artifact@v4
+        with:
+          name: fishai-checkpoint-${{ github.event.inputs.model_size || 'small' }}
+          path: checkpoints/
+
+  benchmark:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Self-Test Benchmark
+        run: |
+          python benchmark.py self-test --config small --device cpu 2>&1 | tee bench_results.txt
+          echo "## Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat bench_results.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
